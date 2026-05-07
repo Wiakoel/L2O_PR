@@ -275,7 +275,7 @@ class SFPRModel(nn.Module):
         self.pc_encoder = PointCloudBEVEncoder(
             BEV_net=BEVUNetEncoder(
                 n_height=33, input_batch_norm=True, circular_padding=True,
-                use_wfrm=True, use_x4x5_fusion=False),
+                use_wfrm=False, use_x4x5_fusion=False),
             grid_size=[480, 360, 32], fea_dim=24, out_pt_fea_dim=64,
             max_pt_per_encode=256, fea_compre=32)
 

@@ -108,7 +108,7 @@ class _Down(nn.Module):
 
 
 # =============================================================================
-# 6. MapEncoder (OSM Raster Embedding)
+# 4. MapEncoder (OSM Raster Embedding)
 # =============================================================================
 
 class MapEncoder(nn.Module):
@@ -144,7 +144,7 @@ class MapEncoder(nn.Module):
 
 
 # =============================================================================
-# 7. BEVUNetEncoder
+# 5. BEVUNetEncoder
 # =============================================================================
 
 class BEVUNetEncoder(nn.Module):
@@ -270,7 +270,7 @@ class BEVUNetEncoder(nn.Module):
 
 
 # =============================================================================
-# 8. PointCloudBEVEncoder
+# 6. PointCloudBEVEncoder
 # =============================================================================
 
 class PointCloudBEVEncoder(nn.Module):
@@ -376,7 +376,7 @@ class PointCloudBEVEncoder(nn.Module):
 
 
 # =============================================================================
-# 4. Components
+# Components
 # =============================================================================
 
 class LearnableSoftThresholding(nn.Module):
@@ -502,7 +502,7 @@ class SemanticGuidedWFRM(nn.Module):
 
 
 # =============================================================================
-# 5. Fusion Module
+# Fusion
 # =============================================================================
 
 class X4X5FusionModule(nn.Module):

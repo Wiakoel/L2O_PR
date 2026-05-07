@@ -6,11 +6,9 @@ Paper reference: Shared BEV feature extraction (§4.2 Feature Extraction).
 Definition order follows dependency (depended-upon first):
   1. Constants / helper functions
   2. UNet building blocks
-  3. Semantic-guided feature refinement (WFRM — implementation detail)
-  4. X4X5 fusion module (implementation detail)
-  5. MapEncoder (OSM raster embedding)
-  6. BEVUNetEncoder (uses all of the above)
-  7. PointCloudBEVEncoder (uses BEVUNetEncoder)
+  3. MapEncoder (OSM raster embedding)
+  4. BEVUNetEncoder (uses all of the above)
+  5. PointCloudBEVEncoder (uses BEVUNetEncoder)
 
 The encoder supports:
   - Fingerprint-aware saliency modulation at deep feature level (x5)

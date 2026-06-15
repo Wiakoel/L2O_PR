@@ -1,46 +1,3 @@
-r"""
-network/FingerPrint.py — Structural Fingerprint Extraction and Matching (SFEM, §4.3)
-
-Implements the robust structural fingerprint matching formulation from the paper:
-
-    Truncated quadratic robust kernel (Eq. 3):
-        φ_τ(u) = min{u, τ²}
-
-    Joint energy with binary gate variables (Eq. 4):
-        Ẽ(T, γ) = ½ Σ_{(i,j)∈U} w_ij [ γ_ij · u_ij(T) + (1 − γ_ij) · τ² ]
-
-    Alternating optimization (§4.3.2):
-        Fingerprint Extraction (Eq. 5): γ_ij^{k+1} = 𝟙{ u_ij(T^k) ≤ τ² }
-        Fingerprint Matching   (Eq. 6): T^{k+1} = argmin_T Σ_C w_ij ‖Tx_i^p − x_j^o‖²
-
-    Symbols:
-        T = (R, t) ∈ SE(2)              — rigid fingerprint pose
-        γ_ij ∈ {0, 1}                   — binary inlier gate
-        u_ij(T) = ‖Tx_i^p − x_j^o‖²    — geometric residual
-        τ > 0                            — truncation threshold (= verify_thresh)
-        w_ij ≥ 0                         — fingerprint-aware matching weight
-        C(γ) = {(i,j) : γ_ij = 1}       — selected fingerprint element correspondence set
-
-    Energy monotonicity (Appendix C):
-        Ẽ(T^{k+1}, γ^{k+1}) ≤ Ẽ(T^k, γ^{k+1}) ≤ Ẽ(T^k, γ^k)
-
-Pipeline:
-    Phase 1 — Structural Anchoring:    saliency-filtered maximal cliques → initial T
-    Phase 2 — Beam Search:             ring-ordered evidence propagation
-    Phase 3 — Alternating Refinement:  bounded gate/Kabsch on candidate pool
-    Phase 4 — Final Scoring:           strict 1-to-1 assignment → (G_ij, is_trusted)
-
-Caller contract:
-    match_structural_fingerprint(...) → (G_ij: float, is_trusted: bool, dbg: dict)
-
-Parameter philosophy:
-    KEEP  — externally configurable (few):
-        verify_thresh (τ), graph_thresh, lambda_attn, beam_width
-    BIND  — derived deterministically from τ:
-        tau_sq, radius_tol, trust_rmse, sigma_geo, anchor_max_rmse, search_radius
-    FIX   — internal constants not exposed to caller
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -81,82 +38,6 @@ def _xy_to_numpy(v: Any) -> np.ndarray:
         v = v.detach().cpu().numpy()
     arr = np.asarray(v, dtype=np.float32)
     return arr[:, :2] if arr.ndim == 2 else arr.reshape(-1, 2)
-
-
-def solve_weighted_kabsch(
-    src: np.ndarray,
-    dst: np.ndarray,
-    weights: Optional[np.ndarray] = None,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    r"""SVD Step (§5): weighted Kabsch / Orthogonal Procrustes.
-
-    Solves  min_{R ∈ SO(d), t}  Σ_n  w_n ‖R q_n + t − m_n‖²
-
-    Construction (§5 Steps 1–6):
-        1. Weighted centroids  q̄ = Σ w q / W,  m̄ = Σ w m / W
-        2. Cross-covariance     C = Σ w (q−q̄)(m−m̄)ᵀ
-        3. SVD  C = U Σ Vᵀ
-        4. D = diag(1, …, 1, det(VUᵀ))  — reflection guard (§5.5)
-        5. R* = V D Uᵀ   ∈ SO(d)
-        6. t* = m̄ − R* q̄
-
-    Returns (R, t) or (None, None) on degenerate input.
-    """
-    n = src.shape[0]
-    if n < 2 or dst.shape[0] < 2:
-        return None, None
-
-    s = src.astype(np.float64)
-    d = dst.astype(np.float64)
-
-    if weights is not None:
-        w = np.asarray(weights, dtype=np.float64).ravel()
-        W = w.sum()
-        if W < 1e-12:
-            return None, None
-        c_s = (w[:, None] * s).sum(0) / W
-        c_d = (w[:, None] * d).sum(0) / W
-        ds = s - c_s
-        dd = d - c_d
-        C = (w[:, None] * ds).T @ dd
-    else:
-        c_s = s.mean(0)
-        c_d = d.mean(0)
-        ds = s - c_s
-        dd = d - c_d
-        C = ds.T @ dd
-
-    try:
-        U, _, Vt = np.linalg.svd(C)
-        R = Vt.T @ U.T
-        # Reflection guard: enforce det(R) = +1
-        if np.linalg.det(R) < 0:
-            Vt[-1, :] *= -1
-            R = Vt.T @ U.T
-        t = c_d - R @ c_s
-        return R.astype(np.float32), t.astype(np.float32)
-    except np.linalg.LinAlgError:
-        return None, None
-
-
-def _bron_kerbosch(adj: List[Set[int]], min_size: int = 3) -> List[List[int]]:
-    """Maximal clique enumeration (fallback when igraph unavailable)."""
-    results: List[List[int]] = []
-    n = len(adj)
-
-    def _bk(R: Set[int], P: Set[int], X: Set[int]) -> None:
-        if not P and not X:
-            if len(R) >= min_size:
-                results.append(sorted(R))
-            return
-        pivot = max(P | X, key=lambda u: len(P & adj[u]))
-        for v in list(P - adj[pivot]):
-            _bk(R | {v}, P & adj[v], X & adj[v])
-            P.discard(v)
-            X.add(v)
-
-    _bk(set(), set(range(n)), set())
-    return results
 
 
 def _greedy_1to1(
@@ -400,51 +281,6 @@ class SE2FingerprintVerifier:
     # ──────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _bucket(nodes, radii, features, r_max, num_rings):
-        bw = r_max / num_rings
-        bk: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(num_rings)}
-        gid = 0
-        for stype in sorted(nodes.keys()):
-            pts = _xy_to_numpy(nodes[stype])
-            if pts.shape[0] == 0:
-                continue
-            rho = radii.get(stype, np.sqrt(pts[:, 0]**2 + pts[:, 1]**2))
-            rho = np.asarray(rho, dtype=np.float32).ravel()
-            if rho.shape[0] != pts.shape[0]:
-                rho = np.sqrt(pts[:, 0]**2 + pts[:, 1]**2).astype(np.float32)
-            ri = np.clip(np.floor(rho / bw).astype(np.int32), 0, num_rings - 1)
-            ft = None if features is None else features.get(stype)
-            for i in range(pts.shape[0]):
-                bk[int(ri[i])].append({
-                    "xy": pts[i].copy(), "gid": gid, "type": stype,
-                    "rho": float(rho[i]),
-                    "feat": None if ft is None or i >= len(ft) else ft[i],
-                })
-                gid += 1
-        return bk
-
-    @staticmethod
-    def _flatten_buckets(bk, NR):
-        """Flatten ring-bucketed nodes into structured arrays for vectorised ops.
-
-        Returns (xy[N,2], gid[N], rho[N], tid[N]) or None if empty.
-        tid uses _TYPE_TO_ID encoding; unknown types get -1.
-        """
-        xys, gids, rhos, tids = [], [], [], []
-        for r in range(NR):
-            for n in bk.get(r, []):
-                xys.append(n["xy"])
-                gids.append(n["gid"])
-                rhos.append(n["rho"])
-                tids.append(_TYPE_TO_ID.get(n["type"], -1))
-        if not xys:
-            return None
-        return (np.array(xys, dtype=np.float32),
-                np.array(gids, dtype=np.int64),
-                np.array(rhos, dtype=np.float32),
-                np.array(tids, dtype=np.int32))
-
-    @staticmethod
     def _is_collinear(pts, thresh=0.1):
         if pts.shape[0] < 3:
             return True
@@ -469,30 +305,6 @@ class SE2FingerprintVerifier:
         if pf is None or mf is None:
             return FingerprintCandidatePool.empty()
 
-        q_xy, q_gid, q_rho, q_tid = pf
-        m_xy, m_gid, m_rho, m_tid = mf
-        nQ, nM = q_xy.shape[0], m_xy.shape[0]
-
-        # Saliency per query node (ring-based)
-        q_ring = np.clip(np.floor(q_rho / bw).astype(np.int32), 0, NR - 1)
-        q_sal = attn[q_ring]  # [nQ]
-
-        # Pairwise type compatibility [nQ, nM]
-        qt_safe = np.clip(q_tid, 0, _N_TYPES - 1)
-        mt_safe = np.clip(m_tid, 0, _N_TYPES - 1)
-        compat = _COMPAT_MAT[qt_safe[:, None], mt_safe[None, :]]
-        # Zero out unknown types
-        if np.any(q_tid < 0):
-            compat[q_tid < 0, :] = 0.0
-        if np.any(m_tid < 0):
-            compat[:, m_tid < 0] = 0.0
-
-        # Radial proximity gate [nQ, nM]
-        rho_ok = np.abs(q_rho[:, None] - m_rho[None, :]) < self.radius_tol
-
-        # Same-type mask for cross_ok gating
-        same_type = q_tid[:, None] == m_tid[None, :]
-
         def _collect_vec(cross_ok):
             if cross_ok:
                 valid = (compat > 0) & rho_ok
@@ -506,19 +318,6 @@ class SE2FingerprintVerifier:
             qi_idx, mi_idx = np.where(valid)
             if qi_idx.shape[0] == 0:
                 return None
-
-            # Deduplicate by (gid_q, gid_m)
-            pair_keys = q_gid[qi_idx] * 1000000 + m_gid[mi_idx]
-            _, uniq = np.unique(pair_keys, return_index=True)
-            qi_idx, mi_idx = qi_idx[uniq], mi_idx[uniq]
-
-            # ω_ij = (1 + λ · saliency) · (0.5 + 0.5 · sim)
-            s_vals = sim[qi_idx, mi_idx]
-            omega = (1.0 + self.lam * q_sal[qi_idx]) * (0.5 + 0.5 * s_vals)
-
-            # Cross-type discount
-            cross_mask = ~same_type[qi_idx, mi_idx]
-            omega[cross_mask] *= self.compat_discount
 
             return FingerprintCandidatePool(
                 q_xy[qi_idx].astype(np.float32),
@@ -561,31 +360,6 @@ class SE2FingerprintVerifier:
             mn = [n for r in active for n in osm_bk.get(r, [])]
             if len(qn) < aQ or len(mn) < aM:
                 continue
-
-            # Shared semantic support
-            qt: Dict[str, int] = {}
-            mt: Dict[str, int] = {}
-            for n in qn: qt[n["type"]] = qt.get(n["type"], 0) + 1
-            for n in mn: mt[n["type"]] = mt.get(n["type"], 0) + 1
-            shared = sum(min(qt.get(t, 0), mt.get(t, 0)) for t in set(qt) | set(mt))
-            for a, ac in qt.items():
-                for b, bc in mt.items():
-                    if a != b and _sem_compat(a, b) > 0:
-                        shared += min(ac, bc)
-            if shared < aS:
-                continue
-
-            # Build correspondences (vectorised)
-            bw = 50.0 / NR
-            _qxy = np.array([n["xy"] for n in qn], dtype=np.float32)
-            _mxy = np.array([n["xy"] for n in mn], dtype=np.float32)
-            _qgid = np.array([n["gid"] for n in qn], dtype=np.int64)
-            _mgid = np.array([n["gid"] for n in mn], dtype=np.int64)
-            _qrho = np.array([n["rho"] for n in qn], dtype=np.float32)
-            _mrho = np.array([n["rho"] for n in mn], dtype=np.float32)
-            _qtid = np.array([_TYPE_TO_ID.get(n["type"], -1) for n in qn], dtype=np.int32)
-            _mtid = np.array([_TYPE_TO_ID.get(n["type"], -1) for n in mn], dtype=np.int32)
-
             _qt_s = np.clip(_qtid, 0, _N_TYPES - 1)
             _mt_s = np.clip(_mtid, 0, _N_TYPES - 1)
             _cm = _COMPAT_MAT[_qt_s[:, None], _mt_s[None, :]]
@@ -694,36 +468,12 @@ class SE2FingerprintVerifier:
             cur_rmse = float(np.mean(np.linalg.norm(
                 (hyp.query_pts @ hyp.R.T) + hyp.t - hyp.map_pts, axis=1)))
 
-        cands = []
-        for q in aq:
-            qp = (hyp.R @ q["xy"].reshape(2, 1)).ravel() + hyp.t
-            for m in am:
-                if q["type"] != m["type"]:
-                    continue
-                d = float(np.linalg.norm(qp - m["xy"]))
-                if d >= sr:
-                    continue
-                if hyp.size() >= 4 and d > max(1.0, 2.0 * cur_rmse):
-                    continue
-                s = _cosine_sim(q["feat"], m["feat"])
-                if s < self.sem_thresh:
-                    continue
-                cands.append((q, m, s, d))
-
         if not cands:
             sk = hyp.copy(); sk.score *= self.skip_penalty; return [sk]
 
         cands.sort(key=lambda x: x[3])
         cands = cands[:self.max_branches]
-        branches = []
-        for q, m, s, d in cands:
-            h = hyp.copy()
-            w = self._omega(sal, s) * np.exp(-d / max(sr, 1e-6))
-            h.add(q["gid"], m["gid"], q["xy"], m["xy"], w)
-            h.refit_pose()
-            branches.append(h)
-        if len(cands) <= 2:
-            sk = hyp.copy(); sk.score *= self.skip_penalty; branches.append(sk)
+      
         return branches
 
     def _prune(self, hyps, jt=0.8):
@@ -740,83 +490,6 @@ class SE2FingerprintVerifier:
     # ──────────────────────────────────────────────────────────────
     # Phase 3: bounded Gate/SVD alternating refinement (§3–4)
     # ──────────────────────────────────────────────────────────────
-
-    def _alternating_fingerprint_refinement(self, hyp, pool):
-        r"""Bounded alternating optimization for fingerprint extraction and matching (§4.3.2).
-
-        Alternates between:
-            Fingerprint Extraction (Eq. 5):
-                u_ij = ‖T^k x_i^p − x_j^o‖² (geometric residual)
-                γ_ij = 𝟙{u_ij ≤ τ²}          (binary inlier gate)
-                enforce 1-to-1 (greedy, residual-ascending)
-            Fingerprint Matching (Eq. 6):
-                T^{k+1} = weighted Kabsch on C^k = {(i,j): γ_ij=1}
-
-        Stopping: active set unchanged | ‖ΔT‖ < tol | max iters.
-        """
-        dbg = {"inner_iters": 0, "stopped_by": "not_started",
-               "best_n": hyp.size(), "best_rmse": float("inf")}
-
-        if hyp.R is None or hyp.t is None:
-            hyp.refit_pose()
-        if hyp.R is None or pool.P == 0:
-            dbg["stopped_by"] = "invalid"; return hyp, dbg
-
-        best, best_sc = hyp.copy(), -1e30
-        prev_C: Optional[Set[Tuple[int, int]]] = None
-        Rk, tk = hyp.R.copy(), hyp.t.copy()
-
-        for k in range(self.max_inner_iters):
-            dbg["inner_iters"] = k + 1
-
-            # ── Gate Step: γ_ij = 𝟙{u_ij ≤ τ²} ──
-            proj = (pool.q_xy @ Rk.T) + tk
-            u_ij = np.sum((proj - pool.m_xy) ** 2, axis=1)   # squared residuals
-            gamma = u_ij <= self.tau_sq                        # inlier mask
-
-            inl = np.where(gamma)[0]
-            if inl.shape[0] == 0:
-                dbg["stopped_by"] = "no_inliers"; break
-
-            # Greedy 1-to-1 on inliers (best-residual first)
-            active_idx = _greedy_1to1(inl[np.argsort(u_ij[inl])], pool.q_id, pool.m_id)
-            nA = active_idx.shape[0]
-            if nA < self.min_active_pairs:
-                dbg["stopped_by"] = "degenerate"; break
-
-            # Active set convergence
-            C_k = {(int(pool.q_id[i]), int(pool.m_id[i])) for i in active_idx}
-            if prev_C is not None and C_k == prev_C:
-                dbg["stopped_by"] = "converged"; break
-            prev_C = C_k
-
-            aq, am, aw = pool.q_xy[active_idx], pool.m_xy[active_idx], pool.omega[active_idx]
-            if self._is_collinear(aq, self.collin_thresh):
-                dbg["stopped_by"] = "collinear"; break
-
-            # ── SVD Step: weighted Kabsch on C^k ──
-            Rn, tn = solve_weighted_kabsch(aq, am, aw)
-            if Rn is None:
-                dbg["stopped_by"] = "svd_fail"; break
-
-            sc = float(aw.sum())
-            if sc > best_sc:
-                best_sc = sc
-                rmse_k = float(np.sqrt(np.mean(np.sum(((aq @ Rn.T) + tn - am)**2, 1))))
-                best = FingerprintHypothesis.from_arrays(list(C_k), sc, aq.copy(), am.copy(), Rn.copy(), tn.copy())
-                dbg["best_n"] = nA; dbg["best_rmse"] = rmse_k
-
-            if np.linalg.norm(Rn - Rk) < self.pose_tol and \
-               np.linalg.norm(tn - tk) < self.pose_tol:
-                Rk, tk = Rn, tn; dbg["stopped_by"] = "pose_conv"; break
-            Rk, tk = Rn, tn
-        else:
-            dbg["stopped_by"] = "max_iters"
-
-        if best.size() >= hyp.size() and best.R is not None:
-            best.score = max(best.score, hyp.score)
-            return best, dbg
-        return hyp, dbg
 
     # ──────────────────────────────────────────────────────────────
     # Phase 4: final scoring (strict 1-to-1)
@@ -843,29 +516,6 @@ class SE2FingerprintVerifier:
             hyp.refit_pose()
         if hyp.R is None:
             return _e
-
-        R, t = hyp.R, hyp.t
-        proj = (pool.q_xy @ R.T) + t
-        res = np.linalg.norm(proj - pool.m_xy, axis=1)
-
-        gate = np.where(res < self.tau)[0]
-        if gate.shape[0] == 0:
-            return _e
-
-        ps = pool.omega[gate] * np.exp(-res[gate] / self.sigma_geo)
-        assigned = _greedy_1to1(gate[np.argsort(-ps)], pool.q_id, pool.m_id)
-        nU = assigned.shape[0]
-        if nU < 2:
-            return _e
-
-        fr = np.linalg.norm((pool.q_xy[assigned] @ R.T) + t - pool.m_xy[assigned], axis=1)
-        fw = pool.omega[assigned]
-        rmse = float(np.sqrt(np.mean(fr ** 2)))
-        mw = float(fw.mean())
-        npq = max(int(np.unique(pool.q_id).shape[0]), 1)
-        npm = max(int(np.unique(pool.m_id).shape[0]), 1)
-        denom = float(max(min(npq, npm), 1))
-        ir = float(nU) / denom
 
         geo = float(ir * (1.0 / (1.0 + rmse / self.sigma_rmse)) * mw)
 

@@ -39,27 +39,6 @@ def _xy_to_numpy(v: Any) -> np.ndarray:
     arr = np.asarray(v, dtype=np.float32)
     return arr[:, :2] if arr.ndim == 2 else arr.reshape(-1, 2)
 
-
-def _greedy_1to1(
-    indices: np.ndarray, q_ids: np.ndarray, m_ids: np.ndarray,
-) -> np.ndarray:
-    """Greedy 1-to-1 assignment from pre-sorted indices.
-
-    Enforces the unique assignment constraint: each q_id and m_id
-    appears at most once in the accepted set.
-    """
-    used_q: Set[int] = set()
-    used_m: Set[int] = set()
-    acc: List[int] = []
-    for idx in indices:
-        qi, mi = int(q_ids[idx]), int(m_ids[idx])
-        if qi not in used_q and mi not in used_m:
-            used_q.add(qi)
-            used_m.add(mi)
-            acc.append(int(idx))
-    return np.array(acc, dtype=np.intp)
-
-
 # ═══════════════════════════════════════════════════════════════════════
 # Semantic compatibility (cross-modal type matching)
 # ═══════════════════════════════════════════════════════════════════════
@@ -175,7 +154,6 @@ class FingerprintCandidatePool:
         return FingerprintCandidatePool(z2, z2.copy(), np.zeros(0, dtype=np.int64),
                              np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32))
 
-
 # ═══════════════════════════════════════════════════════════════════════
 # AnchorResult
 # ═══════════════════════════════════════════════════════════════════════
@@ -192,36 +170,6 @@ class AnchorResult:
 # ═══════════════════════════════════════════════════════════════════════
 
 class SE2FingerprintVerifier:
-    r"""Structural Fingerprint Extraction and Matching (SFEM, §4.3).
-
-    Solves the robust fingerprint matching energy (Eq. 3):
-        E(T) = ½ Σ w_ij φ_τ(u_ij(T))
-    via coarse-to-fine beam search + bounded gate/Kabsch alternating optimization.
-
-    KEEP parameters (externally configurable):
-        verify_thresh  τ — truncation threshold (metres). THE primary quantity.
-        graph_thresh   — rigidity distance tolerance for clique construction.
-        lambda_attn    λ — saliency amplification in w_ij.
-        beam_width     B — beam cardinality.
-
-    BIND parameters (derived deterministically from τ):
-        tau_sq           = τ²
-        radius_tol       = 1.2 · τ      radial proximity gate
-        trust_rmse       = 0.75 · τ     trust decision RMSE ceiling
-        sigma_geo        = 0.5 · τ      final scoring pair-score decay
-        sigma_rmse       = 0.5 · τ      final scoring RMSE penalty
-        anchor_max_rmse  = 2.0 · τ      Phase 1 init RMSE ceiling
-        search_radius_0  = 0.8 · τ      initial Phase 2 search radius
-
-    FIX parameters (internal constants):
-        max_inner_iters=3, min_active_pairs=3, pose_tol=0.01,
-        max_branches=5, skip_penalty=0.98, max_anchor_hyps=3,
-        anchor_min_clique=3, anchor_min_support=2, ring_tol=2,
-        aess_tau_q=4, aess_tau_m=4, aess_tau_pair=8, aess_tau_shared=4,
-        semantic_thresh=0.3, min_pool_compat=12, compat_discount=0.5,
-        collinearity_thresh=0.1, trust_min_size=4, trust_min_ratio=0.30,
-        min_search_radius=0.5, radius_decay=0.95
-    """
 
     def __init__(
         self,
@@ -344,58 +292,6 @@ class SE2FingerprintVerifier:
         last_nc = -1
         aQ, aM, aP, aS = self.aess
 
-        for step in range(1, len(ring_order) + 1):
-            prefix.append(ring_order[step - 1])
-            new_act: Set[int] = set()
-            for r in prefix:
-                for dr in range(-self.ring_tol, self.ring_tol + 1):
-                    nr = r + dr
-                    if 0 <= nr < NR:
-                        new_act.add(nr)
-            if new_act == active:
-                continue
-            active = new_act
-
-            qn = [n for r in active for n in pc_bk.get(r, [])]
-            mn = [n for r in active for n in osm_bk.get(r, [])]
-            if len(qn) < aQ or len(mn) < aM:
-                continue
-            _qt_s = np.clip(_qtid, 0, _N_TYPES - 1)
-            _mt_s = np.clip(_mtid, 0, _N_TYPES - 1)
-            _cm = _COMPAT_MAT[_qt_s[:, None], _mt_s[None, :]]
-            _rho_ok = np.abs(_qrho[:, None] - _mrho[None, :]) < self.radius_tol
-            _valid = (_cm > 0) & _rho_ok & (_cm >= self.sem_thresh)
-
-            _ci, _cj = np.where(_valid)
-            nc = _ci.shape[0]
-            if nc < aP or nc == last_nc:
-                continue
-            last_nc = nc
-
-            sp = _qxy[_ci]
-            dp = _mxy[_cj]
-            si = _qgid[_ci]
-            di = _mgid[_cj]
-
-            _qring = np.clip(np.floor(_qrho[_ci] / bw).astype(np.int32), 0, NR - 1)
-            _sal = attn[_qring]
-            _s_vals = _cm[_ci, _cj]
-            wc_arr = ((1.0 + self.lam * _sal) * (0.5 + 0.5 * _s_vals)).astype(np.float32)
-            M = nc
-
-            ds = np.linalg.norm(sp[:, None] - sp[None], axis=-1)
-            dd = np.linalg.norm(dp[:, None] - dp[None], axis=-1)
-            adj = (np.abs(ds - dd) < self.graph_thresh) & \
-                  (si[:, None] != si[None]) & (di[:, None] != di[None])
-            np.fill_diagonal(adj, False)
-            edges = np.argwhere(np.triu(adj, 1))
-            if edges.size == 0:
-                continue
-
-            eu, ev = edges[:, 0], edges[:, 1]
-            ew = (0.5 * (wc_arr[eu] + wc_arr[ev]) *
-                  np.exp(-np.abs(ds[eu, ev] - dd[eu, ev]) / geo_sig)).astype(np.float32)
-
             if _HAVE_IGRAPH:
                 g = ig.Graph(n=M, edges=edges.tolist(), directed=False)
                 g.es["weight"] = ew.tolist()
@@ -409,34 +305,6 @@ class SE2FingerprintVerifier:
             if not cliques:
                 continue
 
-            anchors: List[FingerprintHypothesis] = []
-            for cl in cliques:
-                ci = list(cl)
-                if len(ci) < self.anchor_min_clique:
-                    continue
-                cq = sp[ci]
-                if self._is_collinear(cq, self.collin_thresh):
-                    continue
-                cm = dp[ci]
-                Rc, tc = solve_weighted_kabsch(cq, cm)
-                if Rc is None:
-                    continue
-                rmse = float(np.sqrt(np.mean(np.sum(((cq @ Rc.T) + tc - cm)**2, 1))))
-                if rmse > self.anchor_max_rmse:
-                    continue
-                # External support
-                ap = (sp @ Rc.T) + tc
-                sup = np.linalg.norm(ap - dp, axis=1) < self.tau
-                cmask = np.zeros(M, dtype=bool); cmask[ci] = True
-                if int(np.sum(sup & ~cmask)) < self.anchor_min_support:
-                    continue
-                bw_sum = float(wc_arr[ci].sum())
-                ew_sum = float(wc_arr[np.where(sup & ~cmask)[0]].sum())
-                h = FingerprintHypothesis(score=bw_sum + ew_sum, R=Rc, t=tc)
-                for idx in ci:
-                    h.add(int(si[idx]), int(di[idx]), sp[idx], dp[idx], float(wc_arr[idx]))
-                h.R, h.t = Rc, tc
-                anchors.append(h)
 
             if anchors:
                 anchors.sort(key=lambda x: x.score, reverse=True)
@@ -456,23 +324,6 @@ class SE2FingerprintVerifier:
             hyp.refit_pose()
             if hyp.R is None:
                 sk = hyp.copy(); sk.score *= self.skip_penalty; return [sk]
-
-        uq, um = hyp.used_q(), hyp.used_m()
-        aq = [n for n in q_nodes if n["gid"] not in uq]
-        am = [n for n in m_nodes if n["gid"] not in um]
-        if not aq or not am:
-            sk = hyp.copy(); sk.score *= self.skip_penalty; return [sk]
-
-        cur_rmse = 0.0
-        if hyp.size() >= 3:
-            cur_rmse = float(np.mean(np.linalg.norm(
-                (hyp.query_pts @ hyp.R.T) + hyp.t - hyp.map_pts, axis=1)))
-
-        if not cands:
-            sk = hyp.copy(); sk.score *= self.skip_penalty; return [sk]
-
-        cands.sort(key=lambda x: x[3])
-        cands = cands[:self.max_branches]
       
         return branches
 
@@ -496,14 +347,6 @@ class SE2FingerprintVerifier:
     # ──────────────────────────────────────────────────────────────
 
     def _extract_fingerprint_score(self, hyp, pool):
-        r"""Compute fingerprint consistency score G_ij via strict 1-to-1 assignment.
-
-        A. Project pool.q_xy under pose T → geometric residuals
-        B. Gate: keep residuals ‖u_ij‖ < τ
-        C. pair_score = ω_ij · exp(−‖r‖ / σ_geo)
-        D. Greedy 1-to-1 (score-descending)
-        E. G_ij = inlier_ratio · rmse_penalty · mean_ω
-        """
         _e = {"n_inliers": 0, "rmse": float("inf"), "inlier_ratio": 0.0,
               "mean_pair_weight": 0.0, "geo_score": 0.0, "clique_size": hyp.size(),
               "R": None, "t": None, "theta": None, "rho": None,
